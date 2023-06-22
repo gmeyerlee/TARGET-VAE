@@ -214,7 +214,7 @@ class GroupConvSep(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, bias=True, input_rot_dim=1, output_rot_dim=4):
-        super(GroupConv, self).__init__()
+        super(GroupConvSep, self).__init__()
         self.ksize = kernel_size
 
         kernel_size = _pair(kernel_size)
@@ -482,7 +482,7 @@ class InferenceNetwork_AttentionTranslation_AttentionRotationSep(nn.Module):
     def __init__(self, n, in_channels, latent_dim, kernels_num=128, kernels_size=65, padding=16, activation=nn.LeakyReLU
                  , groupconv=0, rot_refinement=False, theta_prior=np.pi, normal_prior_over_r=True):
 
-        super(InferenceNetwork_AttentionTranslation_AttentionRotation, self).__init__()
+        super(InferenceNetwork_AttentionTranslation_AttentionRotationSep, self).__init__()
 
         self.activation = activation()
         self.latent_dim = latent_dim
