@@ -293,7 +293,7 @@ def eval_minibatch(x, y, generator_model, encoder_model, t_inf, r_inf, epoch, de
 
 
 
-def train_epoch(iterator, x_coord, generator_model, encoder_model, optim, t_inf, r_inf
+def train_epoch(iterator, x_coord, generator_model, encoder_model, optim, arch_optim, t_inf, r_inf
                 , epoch, num_epochs, N, device, params, theta_prior, groupconv, image_dim):
 
     generator_model.train()
@@ -317,7 +317,9 @@ def train_epoch(iterator, x_coord, generator_model, encoder_model, optim, t_inf,
         loss.backward()
 
         optim.step()
+        arch_optim.step()
         optim.zero_grad()
+        arch_optim.zero_grad()
 
         elbo = elbo.item()
         gen_loss = -log_p_x_g_z.item()
@@ -427,6 +429,10 @@ def main():
 
     parser.add_argument('-d', '--device', type=int, default=0, help='compute device to use (default:0)')
 
+    parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
+    parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
+    parser.add_argument('--tau_decay', type=float, default=0.99, help='Temperature decay for arch weight gumbel softmax')
+
     args = parser.parse_args()
     num_epochs = args.num_epochs
 
@@ -495,14 +501,14 @@ def main():
     data_train = torch.utils.data.TensorDataset(y_train)
     data_test = torch.utils.data.TensorDataset(y_test)
 
-    
+
     z_dim = args.z_dim
     print('# training with z-dim:', z_dim, file=sys.stderr)
 
     generator_num_layers = args.generator_num_layers
     generator_hidden_dim = args.generator_hidden_dim
     generator_resid = args.generator_resid_layers
-    
+
     fourier_expansion = args.fourier_expansion
     fourier_sigma = max(2.0 / (image_dim - 1), 2.0 / (image_dim - 1)) # setting sigma value of the fourier expansion to the pixel size in the image
     if fourier_expansion:
@@ -576,12 +582,16 @@ def main():
 
     N = len(mnist_train)
 
-    params = list(generator_model.parameters()) + list(encoder_model.parameters())
+    params = list(generator_model.parameters()) + list(encoder_model.get_params())
     lr = args.learning_rate
     optim = torch.optim.Adam(params, lr=lr)
 
     scheduler = ReduceLROnPlateau(optim, mode='max', factor=0.5, patience=9, threshold=1e-4, threshold_mode='abs', cooldown=0, min_lr=0, eps=1e-08
                                   , verbose=True)
+
+    arch_optim = torch.optim.Adam(encoder_model.arch_parameters(),
+        lr=args.arch_learning_rate, betas=(0.5, 0.999), weight_decay=args.arch_weight_decay)
+
 
     minibatch_size = args.minibatch_size
 
@@ -652,6 +662,10 @@ def main():
             print(line, file=output)
             print(line, file=log_file)
 
+            with torch.no_grad():
+                print(F.softmax(encoder_model.ksize_weight).cpu())
+                print(F.softmax(encoder_model.rdim_weight).cpu())
+
 
             # checking for early stopping
             line = early_stopping(elbo_accum, encoder_model, generator_model, epoch+1)
@@ -665,6 +679,7 @@ def main():
                 print("*** Early stopping ***")
                 break
 
+            encoder_model.tau *= args.tau_decay
             generator_model.to(device)
             encoder_model.to(device)
 

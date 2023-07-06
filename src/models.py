@@ -15,7 +15,6 @@ from torch.distributions.uniform import Uniform
 import torch.nn.init as init
 
 import math
-import numpy as np
 
 
 
