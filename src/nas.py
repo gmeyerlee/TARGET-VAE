@@ -121,6 +121,7 @@ class InferenceSuperNetwork_AttTra_AttRot(nn.Module):
         self.input_size = n
         self.kernels_num = kernels_num
         self.kernels_sizes = kernels_sizes
+        spat_red = max(kernels_sizes) - 2*padding
         self.padding = padding
         self.groupconvs = groupconvs
         self.rot_refinement = rot_refinement
@@ -130,7 +131,7 @@ class InferenceSuperNetwork_AttTra_AttRot(nn.Module):
         self.ksize_weight = Parameter(1e-3 * torch.randn(len(self.kernels_sizes),), requires_grad=True)
         self.rdim_weight = Parameter(1e-3 * torch.randn(len(self.groupconvs),), requires_grad=True)
 
-        self.conv1 = [GroupConv(in_channels, self.kernels_num, k_size, padding=self.padding, input_rot_dim=1, output_rot_dim=max(self.groupconvs)) for k_size in self.kernels_sizes]
+        self.conv1 = [GroupConv(in_channels, self.kernels_num, k_size, padding=(k_size - spat_red)/2, input_rot_dim=1, output_rot_dim=max(self.groupconvs)) for k_size in self.kernels_sizes]
         self.conv2 = [nn.Conv3d(self.kernels_num, self.kernels_num, 1) for _ in len(self.groupconvs)]
 
         self.conv_a = [nn.Conv3d(self.kernels_num, 1, 1) for _ in len(self.groupconvs)]
@@ -167,11 +168,11 @@ class InferenceSuperNetwork_AttTra_AttRot(nn.Module):
         attn = sum([torch.repeat_interleave(att, rdim_max//self.groupconvs[i], dim=1) * betas[i] for i, att in enumerate(attns)]) # <- 3dconv means this is (BxRxHxW)
 
         if self.rot_refinement:
-            if self.groupconv == 4:
+            if max(self.groupconvs) == 4:
                 offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
-            elif self.groupconv == 8:
+            elif max(self.groupconvs) == 8:
                 offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
-            elif self.groupconv == 16:
+            elif max(self.groupconvs) == 16:
                 offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
 
             if self.normal_prior_over_r:
@@ -209,4 +210,115 @@ class InferenceSuperNetwork_AttTra_AttRot(nn.Module):
         else:
             offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
         return attn, q_t_r, p_r, a_sampled, offsets, theta, z
+
+class InferenceSuperNetwork_AttTra_AttRot2(nn.Module):
+    '''
+    Inference with attention on both the translation and rotation values (inference model for TARGET-VAE)
+    This version has two sequential group convolutions
+    '''
+    def __init__(self, n, in_channels, latent_dim, kernels_num=128, kernels_sizes=[[65],[65]], padding=[16, 16], activation=nn.LeakyReLU
+                 , groupconvs=[[0],[0]], rot_refinement=False, theta_prior=np.pi, normal_prior_over_r=True, tau_init=10):
+
+        super(InferenceSuperNetwork_AttTra_AttRot2, self).__init__()
+
+        self.activation = activation()
+        self.latent_dim = latent_dim
+        self.input_size = n
+        self.kernels_num = kernels_num
+        self.kernels_sizes = kernels_sizes
+        spat_red1 = max(kernels_sizes[0]) - 2*padding[0]
+        spat_red2 = max(kernels_sizes[1]) - 2*padding[1]
+        self.padding = padding
+        self.groupconvs = groupconvs
+        self.rot_refinement = rot_refinement
+        self.theta_prior = theta_prior
+        self.normal_prior_over_r = normal_prior_over_r
+        self.tau = tau_init
+        self.ksize_weight = Parameter(1e-3 * torch.randn(len(self.kernels_sizes[0]), 2), requires_grad=True)
+        self.rdim_weight = Parameter(1e-3 * torch.randn(len(self.groupconvs[0]), 2), requires_grad=True)
+
+        self.conv1 = [GroupConv(in_channels, self.kernels_num, k_size, padding=(k_size - spat_red1)/2, input_rot_dim=1, output_rot_dim=max(self.groupconvs[0])) for k_size in self.kernels_sizes[0]]
+        self.conv2 = [GroupConv(self.kernels_num, self.kernels_num, k_size, padding=(k_size - spat_red2)/2, input_rot_dim=max(self.groupconvs[0]), output_rot_dim=max(self.groupconvs[1])) for k_size in self.kernels_sizes[1]]
+
+        self.conv_a = [nn.Conv3d(self.kernels_num, 1, 1) for _ in len(self.groupconvs)]
+        self.conv_r = [nn.Conv3d(self.kernels_num, 2, 1) for _ in len(self.groupconvs)]
+        self.conv_z = [nn.Conv3d(self.kernels_num, 2*self.latent_dim, 1) for _ in len(self.groupconvs)]
+
+    def get_params(self):
+        xlist = []
+        for c1 in self.conv1:
+            xlist += list(c1.parameters())
+        for c2 in self.conv2:
+            xlist += list(c2.parameters())
+        for ca in self.conv_a:
+            xlist += list(ca.parameters())
+        for cr in self.conv_r:
+            xlist += list(cr.parameters())
+        for cz in self.conv_z:
+            xlist += list(cz.parameters())
+        return xlist
+
+    def arch_params(self):
+        return [self.ksize_weight, self.rdim_weight]
+
+    def forward(self, x, device):
+
+        alphas1 = F.gumbel_softmax(self.ksize_weight[:, 0], tau=self.tau)
+        x_out = sum([self.activation(conv_op(x, device)) * alpha for conv_op, alpha in zip(self.conv1, alphas1)])
+        xs_out = [x_out[:, :, ::(rdim_max//rdim), :, :] for rdim in self.groupconvs[0]]
+        betas1 = F.gumbel_softmax(self.rdim_weight[:, 0], tau=self.tau)
+        x_out = sum([torch.repeat_interleave(x_o, max(self.groupconvs[0])//self.groupconvs[0][i], dim=2) * betas1[i] for i, x_o in enumerate(xs_out)])
+        alphas2 = F.gumbel_softmax(self.ksize_weight[:, 1], tau=self.tau)
+        h = sum([self.activation(conv_op(x_out, device)) * alpha for conv_op, alpha in zip(self.conv2, alphas2)])
+        rdim_max = max(self.groupconvs[1])
+        hs = [h[:, :, ::(rdim_max//rdim), :, :] for rdim in self.groupconvs[1]]
+
+        attns = [c_a(h).squeeze(1) for c_a, h in zip(self.conv_a, hs)]
+        betas2 = F.gumbel_softmax(self.rdim_weight[:, 1], tau=self.tau)
+        attn = sum([torch.repeat_interleave(att, rdim_max//self.groupconvs[1][i], dim=1) * betas2[i] for i, att in enumerate(attns)]) # <- 3dconv means this is (BxRxHxW)
+
+        if self.rot_refinement:
+            if self.groupconv == 4:
+                offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
+            elif self.groupconv == 8:
+                offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
+            elif self.groupconv == 16:
+                offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
+
+            if self.normal_prior_over_r:
+                prior_theta = Normal(torch.tensor([0.0]).to(device), torch.tensor([self.theta_prior]).to(device))
+            else:
+                prior_theta = Uniform(torch.tensor([-2*np.pi]).to(device), torch.tensor([2*np.pi]).to(device))
+
+            offsets = offsets.to(device)
+            p_r = prior_theta.log_prob(offsets).unsqueeze(1).unsqueeze(2)
+
+        else:
+            # uniform prior over r when no offsets are being added to the rot_means
+            p_r = torch.zeros(rdim_max).to(device) - np.log(attn.shape[1])
+            p_r = p_r.unsqueeze(1).unsqueeze(2)
+
+        attn = attn + p_r
+        q_t_r = F.log_softmax(attn.view(attn.shape[0], -1), dim=1).view(attn.shape[0], attn.shape[1], attn.shape[2], attn.shape[3]) # B x R x H x W
+
+        a = attn.view(attn.shape[0], -1)
+
+        a_sampled = F.gumbel_softmax(a, dim=-1) #
+        a_sampled = a_sampled.view(h.shape[0], h.shape[2], h.shape[3], h.shape[4])
+
+        zs = [c_z(h) for c_z, h in zip(self.conv_z, hs)]
+        z = sum([torch.repeat_interleave(zi, rdim_max//self.groupconvs[1][i], dim=2) * betas2[i] for i, zi in enumerate(zs)])
+
+        thetas = [c_r(h) for c_r, h in zip(self.conv_z, hs)]
+        theta = sum([torch.repeat_interleave(th, rdim_max//self.groupconvs[1][i], dim=2) * betas2[i] for i, th in enumerate(thetas)])
+
+        if self.rot_refinement:
+            rotation_offset = torch.ones_like(a_sampled) * offsets.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            theta_mu = theta[ :, 0, :, :, : ] + rotation_offset
+            theta_std = theta[ :, 1, :, :, : ]
+            theta = torch.stack((theta_mu, theta_std), dim=1)
+        else:
+            offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
+        return attn, q_t_r, p_r, a_sampled, offsets, theta, z
+
 

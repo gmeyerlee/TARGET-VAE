@@ -14,6 +14,7 @@ from torch.distributions.kl import kl_divergence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import src.models as models
+from src.nas import *
 from src.utils import EarlyStopping
 
 import datetime
@@ -405,10 +406,10 @@ def main():
 
     parser.add_argument('--r-inf', default='attention+offsets', choices=['unimodal', 'attention', 'attention+offsets', 'attention+sep', 'attention+offsets+sep'], help='unimodal | attention | attention+offsets (default: attention+offsets)')
 
-    parser.add_argument('--groupconv', type=int, default=8, choices=[0, 4, 8, 16], help='0 | 4 | 8 | 16 (default:8)')
+    #parser.add_argument('--groupconv', type=int, default=8, choices=[0, 4, 8, 16], help='0 | 4 | 8 | 16 (default:8)')
     parser.add_argument('--encoder-num-layers', type=int, default=2, help='number of hidden layers in the inference model when the translation and rotation inference are unimodal (default:2)')
     parser.add_argument('--encoder-kernel-number', type=int, default=128, help='number of kernels in each layer of the encoder (default: 128)')
-    parser.add_argument('--encoder-kernel-size', type=int, default=28, help='size of kernels in the first layer of the encoder (default: 28)')
+    #parser.add_argument('--encoder-kernel-size', type=int, default=28, help='size of kernels in the first layer of the encoder (default: 28)')
     parser.add_argument('--encoder-padding', type=int, default=8, help='amount of the padding for the encoder (default: 8)')
 
     parser.add_argument('--in-channels', type=int, default=1, help='number of channels in the images (default:1)')
@@ -529,9 +530,9 @@ def main():
     r_inf = args.r_inf
     encoder_num_layers = args.encoder_num_layers
     encoder_kernel_number = args.encoder_kernel_number
-    encoder_kernel_size = args.encoder_kernel_size
+    encoder_kernel_sizes = [12, 20, 28]
     encoder_padding = args.encoder_padding
-    group_conv = args.groupconv
+    group_convs = [4, 8, 16]
 
     print('# translation inference is {}'.format(t_inf), file=sys.stderr)
     print('# rotation inference is {}'.format(r_inf), file=sys.stderr)
@@ -561,9 +562,9 @@ def main():
 
     elif t_inf=='attention' and (r_inf=='attention' or r_inf=='attention+offsets'):
         rot_refinement = (r_inf=='attention+offsets')
-        encoder_model = models.InferenceNetwork_AttentionTranslation_AttentionRotation(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
-                                                                                       , kernels_size=encoder_kernel_size, padding=encoder_padding
-                                                                                       , activation=activation, groupconv=group_conv
+        encoder_model = models.InferenceSuperNetwork_AttTra_AttRot(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+                                                                                       , kernels_sizes=encoder_kernel_sizes, padding=encoder_padding
+                                                                                       , activation=activation, groupconvs=group_convs
                                                                                        , rot_refinement=rot_refinement, theta_prior=theta_prior
                                                                                        , normal_prior_over_r=normal_prior_over_r)
     elif t_inf=='attention' and (r_inf=='attention+sep' or r_inf=='attention+offsets+sep'):
