@@ -127,7 +127,10 @@ class GroupConv(nn.Module):
 
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
-        padding = _pair(padding)
+        if type(padding) == int:
+            padding = _pair(padding)
+        else:
+            padding = padding
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -505,6 +508,82 @@ class InferenceNetwork_AttentionTranslation_AttentionRotationSep(nn.Module):
     def forward(self, x, device):
         x = self.activation(self.conv1(x, device))
         h = self.activation(self.conv2(x))
+
+        attn = self.conv_a(h).squeeze(1) # <- 3dconv means this is (BxRxHxW)
+
+        if self.rot_refinement:
+            if self.groupconv == 4:
+                offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
+            elif self.groupconv == 8:
+                offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
+            elif self.groupconv == 16:
+                offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
+
+            if self.normal_prior_over_r:
+                prior_theta = Normal(torch.tensor([0.0]).to(device), torch.tensor([self.theta_prior]).to(device))
+            else:
+                prior_theta = Uniform(torch.tensor([-2*np.pi]).to(device), torch.tensor([2*np.pi]).to(device))
+
+            offsets = offsets.to(device)
+            p_r = prior_theta.log_prob(offsets).unsqueeze(1).unsqueeze(2)
+
+        else:
+            # uniform prior over r when no offsets are being added to the rot_means
+            p_r = torch.zeros(self.groupconv).to(device) - np.log(attn.shape[1])
+            p_r = p_r.unsqueeze(1).unsqueeze(2)
+
+        attn = attn + p_r
+        q_t_r = F.log_softmax(attn.view(attn.shape[0], -1), dim=1).view(attn.shape[0], attn.shape[1], attn.shape[2], attn.shape[3]) # B x R x H x W
+
+        a = attn.view(attn.shape[0], -1)
+
+        a_sampled = F.gumbel_softmax(a, dim=-1) #
+        a_sampled = a_sampled.view(h.shape[0], h.shape[2], h.shape[3], h.shape[4])
+
+        z = self.conv_z(h)
+
+        theta = self.conv_r(h)
+
+        if self.rot_refinement:
+            rotation_offset = torch.ones_like(a_sampled) * offsets.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            theta_mu = theta[ :, 0, :, :, : ] + rotation_offset
+            theta_std = theta[ :, 1, :, :, : ]
+            theta = torch.stack((theta_mu, theta_std), dim=1)
+        else:
+            offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
+        return attn, q_t_r, p_r, a_sampled, offsets, theta, z
+
+class InferenceNetwork_AttTra_AttRot_Searched(nn.Module):
+    '''
+    Inference with attention on both the translation and rotation values (inference model for TARGET-VAE)
+    '''
+    def __init__(self, n, in_channels, latent_dim, kernels_num=128, kernels_sizes=[65, 65], padding=16, activation=nn.LeakyReLU
+                 , groupconvs=[0, 0], rot_refinement=False, theta_prior=np.pi, normal_prior_over_r=True):
+
+        super(InferenceNetwork_AttTra_AttRot_Searched, self).__init__()
+
+        self.activation = activation()
+        self.latent_dim = latent_dim
+        self.input_size = n
+        self.kernels_num = kernels_num
+        self.kernels_sizes = kernels_sizes
+        self.padding = padding
+        self.groupconv = groupconvs[-1]
+        self.rot_refinement = rot_refinement
+        self.theta_prior = theta_prior
+        self.normal_prior_over_r = normal_prior_over_r
+
+        self.conv1 = GroupConv(in_channels, self.kernels_num, self.kernels_sizes[0], padding=self.padding, input_rot_dim=1, output_rot_dim=groupconvs[0])
+        self.conv2 = GroupConv(self.kernels_num, self.kernels_num, self.kernels_sizes[1], padding="same", input_rot_dim=groupconvs[0], output_rot_dim=groupconvs[1])
+
+        self.conv_a = nn.Conv3d(self.kernels_num, 1, 1)
+        self.conv_r = nn.Conv3d(self.kernels_num, 2, 1)
+        self.conv_z = nn.Conv3d(self.kernels_num, 2*self.latent_dim, 1)
+
+
+    def forward(self, x, device):
+        x = self.activation(self.conv1(x, device))
+        h = self.activation(self.conv2(x, device))
 
         attn = self.conv_a(h).squeeze(1) # <- 3dconv means this is (BxRxHxW)
 

@@ -426,6 +426,7 @@ def main():
     parser.add_argument('--num-epochs', type=int, default=500, help='number of training epochs (default: 500)')
 
     parser.add_argument('-d', '--device', type=int, default=0, help='compute device to use (default:0)')
+    parser.add_argument('--searched-arch', type=int, default=0, help='select an architecture discovered via NAS')
 
     args = parser.parse_args()
     num_epochs = args.num_epochs
@@ -555,11 +556,25 @@ def main():
 
     elif t_inf=='attention' and (r_inf=='attention' or r_inf=='attention+offsets'):
         rot_refinement = (r_inf=='attention+offsets')
-        encoder_model = models.InferenceNetwork_AttentionTranslation_AttentionRotation(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+        if not args.searched_arch:
+            encoder_model = models.InferenceNetwork_AttentionTranslation_AttentionRotation(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
                                                                                        , kernels_size=encoder_kernel_size, padding=encoder_padding
                                                                                        , activation=activation, groupconv=group_conv
                                                                                        , rot_refinement=rot_refinement, theta_prior=theta_prior
                                                                                        , normal_prior_over_r=normal_prior_over_r)
+        elif args.searched_arch == 1:
+            encoder_model = models.InferenceNetwork_AttTra_AttRot_Searched(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+                                                                                       , kernels_sizes=[20, 8], padding=encoder_padding
+                                                                                       , activation=activation, groupconvs=[16, 16]
+                                                                                       , rot_refinement=rot_refinement, theta_prior=theta_prior
+                                                                                       , normal_prior_over_r=normal_prior_over_r)
+        elif args.searched_arch == 2:
+            encoder_model = models.InferenceNetwork_AttTra_AttRot_Searched(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+                                                                                       , kernels_sizes=[20, 8], padding=encoder_padding
+                                                                                       , activation=activation, groupconvs=[4, 16]
+                                                                                       , rot_refinement=rot_refinement, theta_prior=theta_prior
+                                                                                       , normal_prior_over_r=normal_prior_over_r)
+
     elif t_inf=='attention' and (r_inf=='attention+sep' or r_inf=='attention+offsets+sep'):
         rot_refinement = (r_inf=='attention+offsets+sep')
         encoder_model = models.InferenceNetwork_AttentionTranslation_AttentionRotationSep(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number

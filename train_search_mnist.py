@@ -407,6 +407,7 @@ def main():
     parser.add_argument('--r-inf', default='attention+offsets', choices=['unimodal', 'attention', 'attention+offsets', 'attention+sep', 'attention+offsets+sep'], help='unimodal | attention | attention+offsets (default: attention+offsets)')
 
     #parser.add_argument('--groupconv', type=int, default=8, choices=[0, 4, 8, 16], help='0 | 4 | 8 | 16 (default:8)')
+    parser.add_argument('--groupconv-num', type=int, default=1, choices=[1, 2], help='number of group conv layers in encoder')
     parser.add_argument('--encoder-num-layers', type=int, default=2, help='number of hidden layers in the inference model when the translation and rotation inference are unimodal (default:2)')
     parser.add_argument('--encoder-kernel-number', type=int, default=128, help='number of kernels in each layer of the encoder (default: 128)')
     #parser.add_argument('--encoder-kernel-size', type=int, default=28, help='size of kernels in the first layer of the encoder (default: 28)')
@@ -530,9 +531,14 @@ def main():
     r_inf = args.r_inf
     encoder_num_layers = args.encoder_num_layers
     encoder_kernel_number = args.encoder_kernel_number
-    encoder_kernel_sizes = [12, 20, 28]
-    encoder_padding = args.encoder_padding
-    group_convs = [4, 8, 16]
+    if args.groupconv_num == 1:
+        encoder_kernel_sizes = [12, 20, 28]
+        group_convs = [4, 8, 16]
+        encoder_padding = args.encoder_padding
+    elif args.groupconv_num == 2:
+        encoder_kernel_sizes = [[12, 20, 28], [1, 4, 8]]
+        group_convs = [[4, 8, 16], [4, 8, 16]]
+        encoder_padding = [8, 0]
 
     print('# translation inference is {}'.format(t_inf), file=sys.stderr)
     print('# rotation inference is {}'.format(r_inf), file=sys.stderr)
@@ -562,11 +568,19 @@ def main():
 
     elif t_inf=='attention' and (r_inf=='attention' or r_inf=='attention+offsets'):
         rot_refinement = (r_inf=='attention+offsets')
-        encoder_model = models.InferenceSuperNetwork_AttTra_AttRot(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+        if args.groupconv_num == 1:
+            encoder_model = InferenceSuperNetwork_AttTra_AttRot(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
                                                                                        , kernels_sizes=encoder_kernel_sizes, padding=encoder_padding
                                                                                        , activation=activation, groupconvs=group_convs
                                                                                        , rot_refinement=rot_refinement, theta_prior=theta_prior
                                                                                        , normal_prior_over_r=normal_prior_over_r)
+        elif args.groupconv_num == 2:
+            encoder_model = InferenceSuperNetwork_AttTra_AttRot2(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
+                                                                                       , kernels_sizes=encoder_kernel_sizes, padding=encoder_padding
+                                                                                       , activation=activation, groupconvs=group_convs
+                                                                                       , rot_refinement=rot_refinement, theta_prior=theta_prior
+                                                                                       , normal_prior_over_r=normal_prior_over_r)
+
     elif t_inf=='attention' and (r_inf=='attention+sep' or r_inf=='attention+offsets+sep'):
         rot_refinement = (r_inf=='attention+offsets+sep')
         encoder_model = models.InferenceNetwork_AttentionTranslation_AttentionRotationSep(image_dim, in_channels, z_dim, kernels_num=encoder_kernel_number
@@ -590,7 +604,7 @@ def main():
     scheduler = ReduceLROnPlateau(optim, mode='max', factor=0.5, patience=9, threshold=1e-4, threshold_mode='abs', cooldown=0, min_lr=0, eps=1e-08
                                   , verbose=True)
 
-    arch_optim = torch.optim.Adam(encoder_model.arch_parameters(),
+    arch_optim = torch.optim.Adam(encoder_model.get_arch_params(),
         lr=args.arch_learning_rate, betas=(0.5, 0.999), weight_decay=args.arch_weight_decay)
 
 
@@ -610,6 +624,7 @@ def main():
     experiment_description = '_'.join([str(datetime.datetime.now().strftime('%Y-%m-%d-%H-%M'))
                                        , args.dataset, 'zDim', str(z_dim),'translation', t_inf, 'rotation'
                                        , r_inf])
+    group_conv = 16
     if group_conv > 0:
         experiment_description = experiment_description + '_groupconv' + str(group_conv)
 
@@ -638,7 +653,7 @@ def main():
 
         for epoch in range(num_epochs):
 
-            elbo_accum, gen_loss_accum, kl_loss_accum = train_epoch(train_iterator, x_coord, generator_model, encoder_model, optim
+            elbo_accum, gen_loss_accum, kl_loss_accum = train_epoch(train_iterator, x_coord, generator_model, encoder_model, optim, arch_optim
                                                                   , t_inf=t_inf
                                                                   , r_inf=r_inf, epoch=epoch
                                                                   , num_epochs=num_epochs, N=N, device=device, params=params
@@ -664,8 +679,11 @@ def main():
             print(line, file=log_file)
 
             with torch.no_grad():
-                print(F.softmax(encoder_model.ksize_weight).cpu())
-                print(F.softmax(encoder_model.rdim_weight).cpu())
+                print(F.softmax(encoder_model.ksize_weight, dim=0).cpu(), file=output)
+                print(F.softmax(encoder_model.rdim_weight, dim=0).cpu(), file=output)
+                print(F.softmax(encoder_model.ksize_weight, dim=0).cpu(), file=log_file)
+                print(F.softmax(encoder_model.rdim_weight, dim=0).cpu(), file=log_file)
+
 
 
             # checking for early stopping
