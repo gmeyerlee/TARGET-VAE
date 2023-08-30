@@ -21,91 +21,450 @@ import torch.nn.init as init
 import math
 from .models import *
 
-class SuperGroupConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
-                 padding=0, bias=True, input_rot_dim=1, output_rot_dim=4):
-        super(SuperGroupConv, self).__init__()
-        self.ksize = kernel_size
+class SuperDoubleConv(nn.Module):
+    '''
+    NAS search cell for a sequential pair of Rotationwise GroupConvs
+    '''
 
-        kernel_size = _pair(kernel_size)
-        stride = _pair(stride)
-        padding = _pair(padding)
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        #self.alphas1 = alphas1
+        #self.alphas2 = alphas2
+        #self.betas = betas
+        self.tau = 1
+            
+        self.layer1 = nn.ModuleList([GroupRotationWiseConv(in_channels, in_channels, 3, stride=1, padding=1, bias=False),
+                       GroupRotationWiseConv(in_channels, in_channels, 5, stride=1, padding=2, bias=False),
+                       GroupRotationWiseConv(in_channels, in_channels, 7, stride=1, padding=3, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*in_channels, 3, stride=1, padding=1, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*in_channels, 5, stride=1, padding=2, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*in_channels, 7, stride=1, padding=3, bias=False)])
+        self.layer2 = nn.ModuleList([GroupRotationWiseConv(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+                       GroupRotationWiseConv(in_channels, out_channels, 5, stride=stride, padding=2, bias=False),
+                       GroupRotationWiseConv(in_channels, out_channels, 7, stride=stride, padding=3, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*out_channels, 3, stride=stride, padding=1, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*out_channels, 5, stride=stride, padding=2, bias=False),
+                       GroupRotationWiseConv(in_channels, 2*out_channels, 7, stride=stride, padding=3, bias=False)])
+        self.ri_conv = nn.ModuleList([DepthwiseRotationConv(out_channels, out_channels, input_rot_dim=4, output_rot_dim=4),
+                        DepthwiseRotationConv(2*in_channels, in_channels, input_rot_dim=4, output_rot_dim=8),
+                        DepthwiseRotationConv(2*out_channels, out_channels, input_rot_dim=4, output_rot_dim=8),
+                        DepthwiseRotationConv(out_channels, out_channels, input_rot_dim=8, output_rot_dim=4),
+                        DepthwiseRotationConv(out_channels, out_channels, input_rot_dim=8, output_rot_dim=8),
+                        DepthwiseRotationConv(2*out_channels, out_channels, input_rot_dim=8, output_rot_dim=16),
+                        DepthwiseRotationConv(in_channels, in_channels, input_rot_dim=16, output_rot_dim=8),
+                        DepthwiseRotationConv(out_channels, out_channels, input_rot_dim=16, output_rot_dim=8),
+                        DepthwiseRotationConv(out_channels, out_channels, input_rot_dim=16, output_rot_dim=16)])
 
+        self.activation = nn.LeakyReLU(inplace=True)
+
+    def get_params(self):
+        xlist = []
+        for c1 in self.layer1:
+            xlist += list(c1.parameters())
+        for c2 in self.layer2:
+            xlist += list(c2.parameters())
+        for ci in self.ri_conv:
+            xlist += list(ci.parameters())
+        return xlist
+
+    def forward(self, x, alphas1, alphas2, betas, device):
+        alp1 = F.gumbel_softmax(alphas1, tau=self.tau)
+        alp2 = F.gumbel_softmax(alphas2, tau=self.tau)
+        beta = F.gumbel_softmax(betas, tau=self.tau)
+
+        stem1 = self.activation(sum([a1 * gconv(x, device) for a1, gconv in zip(alp1, self.layer1[:3])]))
+        stem1up = self.activation(sum([a1 * gconv(x[:, :, ::4, :, :], device) for a1, gconv in zip(alp1, self.layer1[3:])]))
+        stem2 = self.activation(sum([a2 * gconv(stem1, device) for a2, gconv in zip(alp2, self.layer2[:3])]))
+        stem2up = self.activation(sum([a2 * gconv(stem1[:, :, ::2, :, :], device) for a2, gconv in zip(alp2, self.layer2[3:])]))
+        out = beta[2]*stem2
+       	out[:, :, ::2, :, :] += beta[1]*stem2[:, :, ::2, :, :]
+        out[:, :, ::4, :, :] += beta[0]*stem2[:, :, ::4, :, :]
+        out[:, :, ::4, :, :] += beta[3]*self.activation(self.ri_conv[0](stem2[:, :, ::4, :, :], device))
+        out[:, :, ::2, :, :] += beta[4]*self.activation(self.ri_conv[2](stem2up[:, :, ::2, :, :], device))
+        up_inter = self.activation(self.ri_conv[1](stem1up, device))
+        up_inter = self.activation(sum([a2 * gconv(up_inter, device) for a2, gconv in zip(alp2, self.layer2[3:])]))
+        out += beta[5]*self.activation(self.ri_conv[5](up_inter, device))
+        out[:, :, ::4, :, :] += beta[6]*self.activation(self.ri_conv[3](stem2[:, :, ::2, :, :], device))
+        out[:, :, ::2, :, :] += beta[7]*self.activation(self.ri_conv[4](stem2[:, :, ::2, :, :], device))
+        out += beta[8]*self.activation(self.ri_conv[5](stem2up, device))
+        down_inter = self.activation(self.ri_conv[6](stem1, device))
+        down_inter = self.activation(sum([a2 * gconv(down_inter, device) for a2, gconv in zip(alp2, self.layer2[:3])]))
+        out[:, :, ::4, :, :] += beta[9]*self.activation(self.ri_conv[3](down_inter, device))
+        out[:, :, ::2, :, :] += beta[10]*self.activation(self.ri_conv[7](stem2, device))
+        out += beta[11]*self.activation(self.ri_conv[8](stem2, device))
+
+        return out
+
+class SuperDownNetMNIST(nn.Module):
+    '''
+    Inference Network with several layers of downsampling groupconv
+    '''
+    def __init__(self, rot_refinement=True, in_channels=1, latent_dim=2, theta_prior=np.pi, normal_prior_over_r=True, tau_init=10):
+        super(SuperDownNetMNIST, self).__init__()
         self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.input_rot_dim = input_rot_dim
-        self.output_rot_dim = output_rot_dim
+        self.latent_dim = latent_dim
+        self.tau = tau_init
+        self.groupconvs = [4, 8, 16]
+        self.rot_refinement=rot_refinement
+        self.theta_prior = theta_prior
+        self.normal_prior_over_r = normal_prior_over_r
+        self.kernels_num=64
 
-        self.weight = Parameter(torch.Tensor(
-            out_channels, in_channels, self.input_rot_dim, *kernel_size), requires_grad=True)
-        if bias:
-            self.bias = Parameter(torch.Tensor(out_channels), requires_grad=True)
+
+        self.alphas0 = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
+        self.alphas1 = Parameter(1e-3 * torch.randn(3,2), requires_grad=True) 
+        self.alphas2 = Parameter(1e-3 * torch.randn(3,2), requires_grad=True)
+        self.betas = Parameter(1e-3 * torch.randn(12,2), requires_grad=True)
+        self.betas_out = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
+
+        self.inc = nn.ModuleList([GroupConv(in_channels, 16, 3, padding=1, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 16, 5, padding=2, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 16, 7, padding=3, input_rot_dim=1, output_rot_dim=16)])
+        #self.down1 = SuperDoubleConv(16, 32, self.alphas1[:,0], self.alphas2[:,0], self.betas[:,0], stride=2)
+        #self.down2 = SuperDoubleConv(32, 64, self.alphas1[:,1], self.alphas2[:,1], self.betas[:,1], stride=2)
+        self.down1 = SuperDoubleConv(16, 32, stride=2)
+        self.down2 = SuperDoubleConv(32, 64, stride=2)
+
+ 
+        self.conv_a = nn.ModuleList([nn.Conv3d(self.kernels_num, 1, 1) for _ in self.groupconvs])
+        self.conv_r = nn.ModuleList([nn.Conv3d(self.kernels_num, 2, 1) for _ in self.groupconvs])
+        self.conv_z = nn.ModuleList([nn.Conv3d(self.kernels_num, 2*self.latent_dim, 1) for _ in self.groupconvs])
+
+    def get_params(self):
+        xlist = []
+        xlist += self.down1.get_params()
+        xlist += self.down2.get_params()
+        for ca in self.conv_a:
+            xlist += list(ca.parameters())
+        for cr in self.conv_r:
+            xlist += list(cr.parameters())
+        for cz in self.conv_z:
+            xlist += list(cz.parameters())
+        return xlist
+
+    def get_arch_params(self):
+        return [self.alphas0, self.alphas1, self.alphas2,
+                self.betas, self.betas_out]
+
+    def set_tau(self, tau):
+        self.tau = tau
+        self.down1.tau = tau
+        self.down2.tau = tau
+
+    def forward(self, x, device):
+        alp0 = F.gumbel_softmax(self.alphas0, tau=self.tau)
+        b_o = F.gumbel_softmax(self.betas_out, tau=self.tau)
+        x = sum([a0 * iconv(x, device) for a0, iconv in zip(alp0, self.inc)])
+        x = self.down1(x, self.alphas1[:, 0], self.alphas2[:, 0], self.betas[:, 0], device)
+        h = self.down2(x, self.alphas1[:, 1], self.alphas2[:, 1], self.betas[:, 1], device)
+
+        rdim_max = max(self.groupconvs)
+        hs = [h[:, :, ::(rdim_max//rdim), :, :] for rdim in self.groupconvs]
+
+        attns = [c_a(h).squeeze(1) for c_a, h in zip(self.conv_a, hs)]
+        for i, att in enumerate(attns):
+            if torch.any(torch.isnan(att)).item():
+                print(i, att)
+        attn = sum([torch.repeat_interleave(att, rdim_max//self.groupconvs[i], dim=1) * b_o[i] for i, att in enumerate(attns)])
+
+        if self.rot_refinement:
+            if max(self.groupconvs) == 4:
+                offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
+            elif max(self.groupconvs) == 8:
+                offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
+            elif max(self.groupconvs) == 16:
+                offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
+
+            if self.normal_prior_over_r:
+                prior_theta = Normal(torch.tensor([0.0]).to(device), torch.tensor([self.theta_prior]).to(device))
+            else:
+                prior_theta = Uniform(torch.tensor([-2*np.pi]).to(device), torch.tensor([2*np.pi]).to(device))
+
+            offsets = offsets.to(device)
+            p_r = prior_theta.log_prob(offsets).unsqueeze(1).unsqueeze(2)
+
         else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
+            # uniform prior over r when no offsets are being added to the rot_means
+            p_r = torch.zeros(rdim_max).to(device) - np.log(attn.shape[1])
+            p_r = p_r.unsqueeze(1).unsqueeze(2)
 
-    def reset_parameters(self):
-        n = self.in_channels
-        for k in self.kernel_size:
-            n *= k
-        stdv = 1. / math.sqrt(n)
-        self.weight.data.uniform_(-stdv, stdv)
+        attn = attn + p_r
+        q_t_r = F.log_softmax(attn.view(attn.shape[0], -1), dim=1).view(attn.shape[0], attn.shape[1], attn.shape[2], attn.shape[3]) # B x R x H x W
 
-        if self.bias is not None:
-            self.bias.data.uniform_(-stdv, stdv)
+        a = attn.view(attn.shape[0], -1)
 
-    def trans_filter(self, device):
-        '''
-        Building r rotated filters
-        '''
-        res = torch.zeros(self.weight.shape[0], self.output_rot_dim,
-                          self.weight.shape[1], self.weight.shape[2],
-                          self.weight.shape[3], self.weight.shape[4]).to(device)
-        d_theta = 2*np.pi / self.output_rot_dim
-        theta = 0.0
+        a_sampled = F.gumbel_softmax(a, dim=-1) #
+        a_sampled = a_sampled.view(hs[-1].shape[0], hs[-1].shape[2], hs[-1].shape[3], hs[-1].shape[4])
 
-        for i in range(self.output_rot_dim):
-            #create the rotation matrix
-            rot = torch.zeros(self.weight.shape[0], 3, 4).to(device)
-            rot[:,0,0] = np.cos(theta)
-            rot[:,0,1] = np.sin(theta)
-            rot[:,1,0] = -np.sin(theta)
-            rot[:,1,1] = np.cos(theta)
+        zs = [c_z(h) for c_z, h in zip(self.conv_z, hs)]
+        z = sum([torch.repeat_interleave(zi, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, zi in enumerate(zs)])
 
-            grid = F.affine_grid(rot, self.weight.shape, align_corners=False)
-            res[:, i, :, :, :] = F.grid_sample(self.weight, grid, align_corners=False)
+        thetas = [c_r(h) for c_r, h in zip(self.conv_z, hs)]
+        theta = sum([torch.repeat_interleave(th, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, th in enumerate(thetas)])
 
-            theta += d_theta
+        if self.rot_refinement:
+            rotation_offset = torch.ones_like(a_sampled) * offsets.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            theta_mu = theta[ :, 0, :, :, : ] + rotation_offset
+            theta_std = theta[ :, 1, :, :, : ]
+            theta = torch.stack((theta_mu, theta_std), dim=1)
+        else:
+            offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
+        return attn, q_t_r, p_r, a_sampled, offsets, theta, z
 
-        return res
+class SuperUNetMNIST(nn.Module):
+    '''
+    Inference Network with several layers of downsampling groupconv and corresponding upsampling
+    '''
+    def __init__(self, rot_refinement=True, in_channels=1, latent_dim=2, theta_prior=np.pi, normal_prior_over_r=True, tau_init=10):
+        super(SuperUNetMNIST, self).__init__()
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.tau = tau_init
+        self.groupconvs = [4, 8, 16]
+        self.rot_refinement=rot_refinement
+        self.theta_prior = theta_prior
+        self.normal_prior_over_r = normal_prior_over_r
+        self.kernels_num=16
 
-    def forward(self, input, device):
-        tw = self.trans_filter(device)
 
-        tw_shape = (self.out_channels*self.output_rot_dim,
-                    self.in_channels*self.input_rot_dim,
-                    self.ksize, self.ksize)
+        self.alphas0 = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
+        self.alphas1 = Parameter(1e-3 * torch.randn(3,4), requires_grad=True) 
+        self.alphas2 = Parameter(1e-3 * torch.randn(3,4), requires_grad=True)
+        self.betas = Parameter(1e-3 * torch.randn(12,4), requires_grad=True)
+        self.betas_out = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
 
-        tw = tw.view(tw_shape)
+        self.inc = nn.ModuleList([GroupConv(in_channels, 16, 3, padding=1, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 16, 5, padding=2, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 16, 7, padding=3, input_rot_dim=1, output_rot_dim=16)])
+        self.down1 = SuperDoubleConv(16, 32, stride=2)
+        self.down2 = SuperDoubleConv(32, 64, stride=2)
+        self.upsamp1 = nn.Upsample(scale_factor=(1,2,2), mode='trilinear', align_corners=True)
+        self.upsamp2 = nn.Upsample(scale_factor=(1,2,2), mode='trilinear', align_corners=True)
 
-        input_shape = input.size()
-        input = input.view(input_shape[0], self.in_channels*self.input_rot_dim, input_shape[-2],
-                           input_shape[-1])
+        self.up1 = SuperDoubleConv(96, 32)
+        self.up2 = SuperDoubleConv(48, 16)
 
-        y = F.conv2d(input, weight=tw, bias=None, stride=self.stride,
-                        padding=self.padding)
+ 
+        self.conv_a = nn.ModuleList([nn.Conv3d(self.kernels_num, 1, 1) for _ in self.groupconvs])
+        self.conv_r = nn.ModuleList([nn.Conv3d(self.kernels_num, 2, 1) for _ in self.groupconvs])
+        self.conv_z = nn.ModuleList([nn.Conv3d(self.kernels_num, 2*self.latent_dim, 1) for _ in self.groupconvs])
 
-        batch_size, _, ny_out, nx_out = y.size()
-        y = y.view(batch_size, self.out_channels, self.output_rot_dim, ny_out, nx_out)
+    def get_params(self):
+        xlist = []
+        xlist += self.down1.get_params()
+        xlist += self.down2.get_params()
+        xlist += self.up1.get_params()
+        xlist += self.up2.get_params()
 
-        if self.bias is not None:
-            bias = self.bias.view(1, self.out_channels, 1, 1, 1)
-            y = y + bias
+        for ca in self.conv_a:
+            xlist += list(ca.parameters())
+        for cr in self.conv_r:
+            xlist += list(cr.parameters())
+        for cz in self.conv_z:
+            xlist += list(cz.parameters())
+        return xlist
 
-        return y
+    def get_arch_params(self):
+        return [self.alphas0, self.alphas1, self.alphas2,
+                self.betas, self.betas_out]
+
+    def set_tau(self, tau):
+        self.tau = tau
+        self.down1.tau = tau
+        self.down2.tau = tau
+        self.up1.tau = tau
+        self.up2.tau = tau
+
+
+    def forward(self, x, device):
+
+        def pad_upsample(x, encFeatures):
+            diffY = x.size()[3] - encFeatures.size()[3]
+            diffX = x.size()[4] - encFeatures.size()[4]
+            encFeatures = F.pad(encFeatures, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+            return torch.cat([encFeatures, x], dim=1)
+
+        alp0 = F.gumbel_softmax(self.alphas0, tau=self.tau)
+        b_o = F.gumbel_softmax(self.betas_out, tau=self.tau)
+        x = sum([a0 * iconv(x, device) for a0, iconv in zip(alp0, self.inc)])
+        x1 = self.down1(x, self.alphas1[:, 0], self.alphas2[:, 0], self.betas[:, 0], device)
+        x2 = self.down2(x1, self.alphas1[:, 1], self.alphas2[:, 1], self.betas[:, 1], device)
+        x2_up = self.upsamp1(x2)
+        x3 = self.up1(pad_upsample(x2_up, x1), self.alphas1[:, 2], self.alphas2[:, 2], self.betas[:, 2], device)
+        x3_up = self.upsamp2(x3)
+        h = self.up2(pad_upsample(x3_up, x), self.alphas1[:, 3], self.alphas2[:, 3], self.betas[:, 3], device)
+
+        rdim_max = max(self.groupconvs)
+        hs = [h[:, :, ::(rdim_max//rdim), :, :] for rdim in self.groupconvs]
+
+        attns = [c_a(h).squeeze(1) for c_a, h in zip(self.conv_a, hs)]
+        attn = sum([torch.repeat_interleave(att, rdim_max//self.groupconvs[i], dim=1) * b_o[i] for i, att in enumerate(attns)])
+
+        if self.rot_refinement:
+            if max(self.groupconvs) == 4:
+                offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
+            elif max(self.groupconvs) == 8:
+                offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
+            elif max(self.groupconvs) == 16:
+                offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
+
+            if self.normal_prior_over_r:
+                prior_theta = Normal(torch.tensor([0.0]).to(device), torch.tensor([self.theta_prior]).to(device))
+            else:
+                prior_theta = Uniform(torch.tensor([-2*np.pi]).to(device), torch.tensor([2*np.pi]).to(device))
+
+            offsets = offsets.to(device)
+            p_r = prior_theta.log_prob(offsets).unsqueeze(1).unsqueeze(2)
+
+        else:
+            # uniform prior over r when no offsets are being added to the rot_means
+            p_r = torch.zeros(rdim_max).to(device) - np.log(attn.shape[1])
+            p_r = p_r.unsqueeze(1).unsqueeze(2)
+
+        attn = attn + p_r
+        q_t_r = F.log_softmax(attn.view(attn.shape[0], -1), dim=1).view(attn.shape[0], attn.shape[1], attn.shape[2], attn.shape[3]) # B x R x H x W
+
+        a = attn.view(attn.shape[0], -1)
+
+        a_sampled = F.gumbel_softmax(a, dim=-1) #
+        a_sampled = a_sampled.view(hs[-1].shape[0], hs[-1].shape[2], hs[-1].shape[3], hs[-1].shape[4])
+
+        zs = [c_z(h) for c_z, h in zip(self.conv_z, hs)]
+        z = sum([torch.repeat_interleave(zi, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, zi in enumerate(zs)])
+
+        thetas = [c_r(h) for c_r, h in zip(self.conv_z, hs)]
+        theta = sum([torch.repeat_interleave(th, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, th in enumerate(thetas)])
+
+        if self.rot_refinement:
+            rotation_offset = torch.ones_like(a_sampled) * offsets.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            theta_mu = theta[ :, 0, :, :, : ] + rotation_offset
+            theta_std = theta[ :, 1, :, :, : ]
+            theta = torch.stack((theta_mu, theta_std), dim=1)
+        else:
+            offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
+        return attn, q_t_r, p_r, a_sampled, offsets, theta, z
+
+
+class SuperDownNetEMPIAR(nn.Module):
+    '''
+    Inference Network with several layers of downsampling groupconv
+    '''
+    def __init__(self, rot_refinement=True, in_channels=1, latent_dim=2, theta_prior=np.pi, normal_prior_over_r=True, tau_init=10):
+        super(SuperDownNetEMPIAR, self).__init__()
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.tau = tau_init
+        self.groupconvs = [4, 8, 16]
+        self.rot_refinement=rot_refinement
+        self.theta_prior = theta_prior
+        self.normal_prior_over_r = normal_prior_over_r
+        self.kernels_num=128
+
+
+        self.alphas0 = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
+        self.alphas1 = Parameter(1e-3 * torch.randn(3,4), requires_grad=True) 
+        self.alphas2 = Parameter(1e-3 * torch.randn(3,4), requires_grad=True)
+        self.betas = Parameter(1e-3 * torch.randn(12,4), requires_grad=True)
+        self.betas_out = Parameter(1e-3 * torch.randn(3,), requires_grad=True)
+
+        self.inc = nn.ModuleList([GroupConv(in_channels, 8, 3, padding=1, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 8, 5, padding=2, input_rot_dim=1, output_rot_dim=16),
+                    GroupConv(in_channels, 8, 7, padding=3, input_rot_dim=1, output_rot_dim=16)])
+        self.down1 = SuperDoubleConv(8, 16, stride=2)
+        self.down2 = SuperDoubleConv(16, 32, stride=2)
+        self.down3 = SuperDoubleConv(32, 64, stride=2)
+        self.down4 = SuperDoubleConv(64, 128, stride=2)
+
+ 
+        self.conv_a = nn.ModuleList([nn.Conv3d(self.kernels_num, 1, 1) for _ in self.groupconvs])
+        self.conv_r = nn.ModuleList([nn.Conv3d(self.kernels_num, 2, 1) for _ in self.groupconvs])
+        self.conv_z = nn.ModuleList([nn.Conv3d(self.kernels_num, 2*self.latent_dim, 1) for _ in self.groupconvs])
+
+    def get_params(self):
+        xlist = []
+        xlist += self.down1.get_params()
+        xlist += self.down2.get_params()
+        xlist += self.down3.get_params()
+        xlist += self.down4.get_params()
+        for ca in self.conv_a:
+            xlist += list(ca.parameters())
+        for cr in self.conv_r:
+            xlist += list(cr.parameters())
+        for cz in self.conv_z:
+            xlist += list(cz.parameters())
+        return xlist
+
+    def get_arch_params(self):
+        return [self.alphas0, self.alphas1, self.alphas2,
+                self.betas, self.betas_out]
+
+    def set_tau(self, tau):
+        self.tau = tau
+        self.down1.tau = tau
+        self.down2.tau = tau
+        self.down3.tau = tau
+        self.down4.tau = tau
+
+    def forward(self, x, device):
+        alp0 = F.gumbel_softmax(self.alphas0, tau=self.tau)
+        b_o = F.gumbel_softmax(self.betas_out, tau=self.tau)
+        x = sum([a0 * iconv(x, device) for a0, iconv in zip(alp0, self.inc)])
+        x = self.down1(x, self.alphas1[:, 0], self.alphas2[:, 0], self.betas[:, 0], device)
+        x = self.down2(x, self.alphas1[:, 1], self.alphas2[:, 1], self.betas[:, 1], device)
+        x = self.down3(x, self.alphas1[:, 2], self.alphas2[:, 2], self.betas[:, 2], device)
+        h = self.down4(x, self.alphas1[:, 3], self.alphas2[:, 3], self.betas[:, 3], device)
+
+        rdim_max = max(self.groupconvs)
+        hs = [h[:, :, ::(rdim_max//rdim), :, :] for rdim in self.groupconvs]
+
+        attns = [c_a(h).squeeze(1) for c_a, h in zip(self.conv_a, hs)]
+        attn = sum([torch.repeat_interleave(att, rdim_max//self.groupconvs[i], dim=1) * b_o[i] for i, att in enumerate(attns)])
+
+        if self.rot_refinement:
+            if max(self.groupconvs) == 4:
+                offsets = torch.tensor([0, np.pi/2, np.pi, -np.pi/2]).type(torch.float)
+            elif max(self.groupconvs) == 8:
+                offsets = torch.tensor([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4]).type(torch.float)
+            elif max(self.groupconvs) == 16:
+                offsets = torch.tensor([0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2, 5*np.pi/8, 3*np.pi/4, 7*np.pi/8, np.pi, -7*np.pi/8, -3*np.pi/4, -5*np.pi/8, -np.pi/2, -3*np.pi/8, -np.pi/4, -np.pi/8]).type(torch.float)
+
+            if self.normal_prior_over_r:
+                prior_theta = Normal(torch.tensor([0.0]).to(device), torch.tensor([self.theta_prior]).to(device))
+            else:
+                prior_theta = Uniform(torch.tensor([-2*np.pi]).to(device), torch.tensor([2*np.pi]).to(device))
+
+            offsets = offsets.to(device)
+            p_r = prior_theta.log_prob(offsets).unsqueeze(1).unsqueeze(2)
+
+        else:
+            # uniform prior over r when no offsets are being added to the rot_means
+            p_r = torch.zeros(rdim_max).to(device) - np.log(attn.shape[1])
+            p_r = p_r.unsqueeze(1).unsqueeze(2)
+
+        attn = attn + p_r
+        q_t_r = F.log_softmax(attn.view(attn.shape[0], -1), dim=1).view(attn.shape[0], attn.shape[1], attn.shape[2], attn.shape[3]) # B x R x H x W
+
+        a = attn.view(attn.shape[0], -1)
+
+        a_sampled = F.gumbel_softmax(a, dim=-1) #
+        a_sampled = a_sampled.view(hs[-1].shape[0], hs[-1].shape[2], hs[-1].shape[3], hs[-1].shape[4])
+
+        zs = [c_z(h) for c_z, h in zip(self.conv_z, hs)]
+        z = sum([torch.repeat_interleave(zi, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, zi in enumerate(zs)])
+
+        thetas = [c_r(h) for c_r, h in zip(self.conv_z, hs)]
+        theta = sum([torch.repeat_interleave(th, rdim_max//self.groupconvs[i], dim=2) * b_o[i] for i, th in enumerate(thetas)])
+
+        if self.rot_refinement:
+            rotation_offset = torch.ones_like(a_sampled) * offsets.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            theta_mu = theta[ :, 0, :, :, : ] + rotation_offset
+            theta_std = theta[ :, 1, :, :, : ]
+            theta = torch.stack((theta_mu, theta_std), dim=1)
+        else:
+            offsets = torch.tensor([0]*attn.shape[1]).type(torch.float).to(device)
+        return attn, q_t_r, p_r, a_sampled, offsets, theta, z
+
 
 class InferenceSuperNetwork_AttTra_AttRot(nn.Module):
     '''

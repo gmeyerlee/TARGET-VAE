@@ -221,7 +221,10 @@ class GroupConvSep(nn.Module):
 
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
-        padding = _pair(padding)
+        if type(padding) == int:
+            padding = _pair(padding)
+        else:
+            padding = padding
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -305,6 +308,98 @@ class GroupConvSep(nn.Module):
             y2 = y2 + bias
 
         return y2
+
+class GroupRotationWiseConv(GroupConv):
+    '''
+    In the forward function, the covolutional filters are only applied on the 
+    part of the feature map with corresponding rotations.
+    
+    input_rot_dim is set to 1 since each rotation group only is applied on the 
+    corresponding rotation group of the input.
+    '''
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, bias=True, input_rot_dim=1, output_rot_dim=16):
+        
+        super().__init__(in_channels, out_channels, kernel_size, stride, 
+                         padding, bias, input_rot_dim, output_rot_dim)
+        
+    
+        
+    def forward(self, input, device):
+        # shape of input is (B, C_in, P_in, H, W)
+        
+        # rotates the self.weight as many as P_out times
+        tw = self.trans_filter(device) # (C_out, P_out, C_in, 1, H, W); here P_in=1
+        tw = tw.squeeze(3) # (C_out, P_out, C_in, H, W)
+        
+        y_groups = []
+        for i in range(input.shape[2]):
+            input_group = input[:, :, i, :, :] # (B, C_in, H, W); inputs coming from the ith P_in 
+            tw_group = tw[:, i, :, :, :] # (C_out, C_in, H, W);  self.weights from the ith P_out
+            y_groups.append(F.conv2d(input_group, weight=tw_group, bias=None, stride=self.stride,
+                               padding=self.padding)) # (B, C_out, C_in, H, W)
+        
+        y = torch.stack(y_groups, dim=2).to(device) # (B, C_out, P_out, C_in, H, W)
+        
+        if self.bias is not None:
+            bias = self.bias.view(1, self.out_channels, 1, 1, 1)
+            y = y + bias
+
+        return y
+
+class DepthwiseRotationConv(nn.Module):
+    '''
+    1x1 conv to interpolate between rotation groups
+    '''
+    def __init__(self, in_channels, out_channels,
+                 bias=True, input_rot_dim=4, output_rot_dim=4):
+
+        super(DepthwiseRotationConv, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.input_rot_dim = input_rot_dim
+        self.output_rot_dim = output_rot_dim
+
+        kernel_size = (input_rot_dim, 1, 1)
+        if input_rot_dim == output_rot_dim:
+            self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, bias=False)
+            self.pad_dim = (0, 0, 0, 0, 0, input_rot_dim-1)
+        elif input_rot_dim > output_rot_dim:
+            self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=(2,1,1), bias=False)
+            self.pad_dim = (0, 0, 0, 0, (input_rot_dim-2)//2, (input_rot_dim-2)//2)
+        else:
+            kernel_size = (output_rot_dim, 1, 1)
+            self.conv = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=(2,1,1), padding=(output_rot_dim-1, 0, 0), bias=False)
+            pad_size = output_rot_dim//4
+            self.pad_dim = (0, 0, 0, 0, pad_size, pad_size)
+        self.kernel_size = kernel_size
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_channels), requires_grad=True)
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        n = self.in_channels
+        for k in self.kernel_size:
+            n *= k
+        stdv = 1. / math.sqrt(n)
+        torch.nn.init.uniform_(self.conv.weight, -stdv, stdv)
+
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, device):
+ 
+        inp_pad = F.pad(input, self.pad_dim, 'circular')
+        y = self.conv(inp_pad)
+
+        if self.bias is not None:
+            bias = self.bias.view(1, self.out_channels, 1, 1, 1)
+            y = y + bias
+
+        return y
 
 
 class InferenceNetwork_UnimodalTranslation_UnimodalRotation(nn.Module):
